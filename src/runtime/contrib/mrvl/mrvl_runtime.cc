@@ -51,8 +51,14 @@ hardware and then runs the generated binary using the Marvell software simulator
 class MarvellSimulatorModuleNode : public ModuleNode {
  public:
   MarvellSimulatorModuleNode(const std::string& symbol_name, const std::string& nodes_json,
-                             const std::string& bin_code)
-      : symbol_name_(symbol_name), nodes_json_(nodes_json), bin_code_(bin_code) {
+                             const std::string& bin_code, const std::string& model_name,
+                             const std::string& working_directory, const std::string& run_mode)
+      : symbol_name_(symbol_name),
+        nodes_json_(nodes_json),
+        bin_code_(bin_code),
+        model_name_(model_name),
+        working_directory_(working_directory),
+        run_mode_(run_mode) {
     set_num_inputs_outputs();
   }
 
@@ -91,6 +97,9 @@ class MarvellSimulatorModuleNode : public ModuleNode {
     stream->Write(symbol_name_);
     stream->Write(nodes_json_);
     stream->Write(bin_code_);
+    stream->Write(model_name_);
+    stream->Write(working_directory_);
+    stream->Write(run_mode_);
   }
 
   static Module LoadFromBinary(void* strm) {
@@ -98,13 +107,23 @@ class MarvellSimulatorModuleNode : public ModuleNode {
     std::string symbol_name;
     std::string nodes_json;
     std::string bin_code;
+    std::string model_name;
+    std::string working_directory;
+    std::string run_mode;
     // Load the symbol_name and other data to construct the module
     ICHECK(stream->Read(&symbol_name))
         << "Marvell-Compiler-ERROR-Internal::Loading symbol name failed";
     ICHECK(stream->Read(&nodes_json))
         << "Marvell-Compiler-ERROR-Internal::Loading nodes json failed";
     ICHECK(stream->Read(&bin_code)) << "Marvell-Compiler-ERROR-Internal::Loading bin code failed";
-    auto n = make_object<MarvellSimulatorModuleNode>(symbol_name, nodes_json, bin_code);
+    ICHECK(stream->Read(&model_name))
+        << "Marvell-Compiler-ERROR-Internal::Loading model name failed";
+    ICHECK(stream->Read(&working_directory))
+        << "Marvell-Compiler-ERROR-Internal::Loading working dir string failed";
+    ICHECK(stream->Read(&run_mode))
+        << "Marvell-Compiler-ERROR-Internal::Loading run mode string failed";
+    auto n = make_object<MarvellSimulatorModuleNode>(symbol_name, nodes_json, bin_code, model_name,
+                                                     working_directory, run_mode);
     return Module(n);
   }
 
@@ -120,6 +139,10 @@ class MarvellSimulatorModuleNode : public ModuleNode {
   std::string symbol_name_;
   std::string nodes_json_;
   std::string bin_code_;
+  std::string model_name_;
+  std::string working_directory_;
+  std::string run_mode_;
+  std::string quantization_type_;
   size_t num_inputs_;
   size_t num_outputs_;
 
@@ -127,8 +150,14 @@ class MarvellSimulatorModuleNode : public ModuleNode {
     ICHECK_EQ(args.size(), num_inputs_ + num_outputs_)
         << "Marvell-Compiler-ERROR-Internal::Mismatch in number of input & number of output args "
            "to subgraph";
-    tvm::runtime::contrib::mrvl::RunMarvellSimulator(args, symbol_name_, bin_code_, num_inputs_,
-                                                     num_outputs_);
+    if (run_mode_ == "sim") {
+      tvm::runtime::contrib::mrvl::RunMarvellSimulator(args, symbol_name_, bin_code_, num_inputs_,
+                                                       num_outputs_);
+    } else if (run_mode_ == "fsim") {
+      tvm::runtime::contrib::mrvl::RunMarvellFsim(args, symbol_name_, bin_code_, model_name_,
+                                                  working_directory_, quantization_type_,
+                                                  num_inputs_, num_outputs_);
+    }
   }
 
   void set_num_inputs_outputs() {
@@ -139,13 +168,17 @@ class MarvellSimulatorModuleNode : public ModuleNode {
 
     std::string value_for_outputs = (*get_value_from_key)(nodes_json_, "num_subgraph_outputs");
     num_outputs_ = std::stoi(value_for_outputs);
+
+    std::string value_for_qtype = (*get_value_from_key)(nodes_json_, "quantization_type");
+    quantization_type_ = std::string(value_for_qtype);
   }
 };
 
-runtime::Module MarvellSimulatorModuleRuntimeCreate(const String& symbol_name,
-                                                    const String& nodes_json,
-                                                    const String& bin_code) {
-  auto n = make_object<MarvellSimulatorModuleNode>(symbol_name, nodes_json, bin_code);
+runtime::Module MarvellSimulatorModuleRuntimeCreate(
+    const String& symbol_name, const String& nodes_json, const String& bin_code,
+    const String& model_name, const String& working_directory, const String& run_mode) {
+  auto n = make_object<MarvellSimulatorModuleNode>(symbol_name, nodes_json, bin_code, model_name,
+                                                   working_directory, run_mode);
   return runtime::Module(n);
 }
 

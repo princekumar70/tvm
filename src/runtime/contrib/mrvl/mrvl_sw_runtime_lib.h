@@ -37,7 +37,12 @@ namespace mrvl {
 
 void RunMarvellSimulator(tvm::runtime::TVMArgs args, const std::string& symbol_name,
                          const std::string& bin_code, size_t num_inputs, size_t num_outputs);
-}
+
+void RunMarvellFsim(tvm::runtime::TVMArgs args, const std::string& symbol_name,
+                    const std::string& bin_code, const String& model_name,
+                    const String& working_directory, const String& quantization_type,
+                    size_t num_inputs, size_t num_outputs);
+}  // namespace mrvl
 }  // namespace contrib
 }  // namespace runtime
 }  // namespace tvm

@@ -35,8 +35,12 @@ namespace mrvl {
 struct MrvlCompilerConfigNode : public tvm::AttrsNode<MrvlCompilerConfigNode> {
   String mcpu;
   IntImm num_tiles;
+  String model_name;
   String mattr;
-
+  String calibration_data;
+  IntImm calibrate_chunk_by;
+  String calibrate_mode;
+  String debug;
   TVM_DECLARE_ATTRS(MrvlCompilerConfigNode, "ext.attrs.MrvlCompilerConfigNode") {
     TVM_ATTR_FIELD(mcpu)
         .describe(
@@ -46,8 +50,23 @@ struct MrvlCompilerConfigNode : public tvm::AttrsNode<MrvlCompilerConfigNode> {
     TVM_ATTR_FIELD(num_tiles)
         .describe("Maximum number of tiles that may be used, possible values = {1,2,4,8}")
         .set_default(IntImm(DataType::Int(64), 8));
+    TVM_ATTR_FIELD(model_name).describe("Model name identifier string").set_default("");
     TVM_ATTR_FIELD(mattr)
         .describe("Attributes for MLIP; possible values = {quantize,wb_pin_ocm}")
+        .set_default("");
+    TVM_ATTR_FIELD(calibration_data)
+        .describe("Path to the npz file which contains calibration data for quantization")
+        .set_default("");
+    TVM_ATTR_FIELD(calibrate_chunk_by)
+        .describe("Number of simulated_quantize ops to profile in a single pass. Defaults to all.")
+        .set_default(IntImm(DataType::Int(64), -1));
+    TVM_ATTR_FIELD(calibrate_mode)
+        .describe("Strategy to use for calibration; possible values = {max_scale, kl_scale}")
+        .set_default("max_scale");
+    TVM_ATTR_FIELD(debug)
+        .describe(
+            "Internal debug string's regulare expression: "
+            "<debug-symbol>=<value>(;<debug-symbol>=<value>)* where <value>=[a-zA-Z0-9_/,]+")
         .set_default("");
   }
 };
