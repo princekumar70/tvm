@@ -18,17 +18,18 @@
 """Utility to compile Marvell models"""
 
 import os
+import sys
 import json
 import shutil
 import tempfile
 import base64
-import numpy as np
+import numpy
 import tvm
 import tvm._ffi
 
 
-@tvm._ffi.register_func("tvm.mrvl.find_value_in_KV_pair")
-def find_value_in_KV_pair(json_input: str, key_to_find: str) -> str:
+@tvm._ffi.register_func("tvm.mrvl.find_value_in_kv_pair")
+def find_value_in_kv_pair(json_input: str, key_to_find: str) -> str:
     """This function takes the graph_json string and key to be searched in
     the json string, using json parser routine it loads the json string
     and access the value using the given key. It raises exception if the
@@ -37,12 +38,11 @@ def find_value_in_KV_pair(json_input: str, key_to_find: str) -> str:
     Parameters
     ----------
     graph_json: String
-       This is the graph_json string
+        This is the graph_json string
 
     Returns
-    -------
-    value_string: string
-       This returns the value string for the given key string
+        value_string: string
+        This returns the value string for the given key string.
     """
     value = ""
     try:
@@ -55,7 +55,7 @@ def find_value_in_KV_pair(json_input: str, key_to_find: str) -> str:
 
 
 @tvm._ffi.register_func("tvm.mrvl.GetNodesJSONString")
-def get_nodes_json_string(graph_json):
+def get_nodes_json_string(graph_json): #, input_quant_info, quantization_type):
     """This takes the graph_json string from MrvlJSONSerializer and adds / modifies
     the json string to a form suitable for the Marvell Backend.
 
@@ -63,6 +63,10 @@ def get_nodes_json_string(graph_json):
     ----------
     graph_json: String
         This is the graph_json string from the MrvlJSONSerializer
+    input_quant_info: String
+        Quantization info to be placed in the json file
+    quantization_type: String
+        Quantization type { "int8", "fp16" }
 
     Returns
     -------
@@ -71,6 +75,10 @@ def get_nodes_json_string(graph_json):
     """
 
     dictionary = json.loads(graph_json)
+    # dictionary["quantization_type"] = quantization_type  # Only needed for fsim run
+    # input_dict = {}
+    # if input_quant_info:
+    #     input_dict = json.loads(input_quant_info.replace("'", '"'))
     # Add Marvell Index and rename "op" and "name" fields
     mrvl_idx = 1
     num_in = 0
@@ -84,8 +92,12 @@ def get_nodes_json_string(graph_json):
             iterator["attrs"]["gamma_const"] = {}
             iterator["attrs"]["var_const"] = {}
             iterator["attrs"]["mean_const"] = {}
+            iterator["attrs"]["input_const"] = {}
+            iterator["attrs"]["lut_const"] = {}
+            iterator["attrs"]["lut_layout"] = {}
             iterator["name"] = "tvmgen_mrvl_main" + "_" + str(mrvl_idx - 1)
             mrvl_idx = mrvl_idx + 1
+        # Fix input layer attributes. Currently NC / NCHW is the layout for all inputs.
         if iterator["op"] == "input":
             iterator["attrs"]["layer_name"] = ["input"]
             iterator["inputs"] = []
@@ -93,6 +105,16 @@ def get_nodes_json_string(graph_json):
             iterator["input_id"] = [in_id]
             iterator["attrs"]["dtype"] = iterator["attrs"]["dtype"][0]
             iterator["attrs"]["shape"] = iterator["attrs"]["shape"][0]
+            # FIXME(shubhaml):
+            # Currently, hardcoding the input min/max values to 0 and 1
+            # This need to be fixed to populate input node min/max
+            input_name = iterator["name"]
+            # if input_dict and input_dict[input_name] and input_dict[input_name]["min"]:
+            #     iterator["attrs"]["q_min_1"] = [input_dict[input_name]["min"]]
+            #     iterator["attrs"]["q_max_1"] = [input_dict[input_name]["max"]]
+            # else:
+            #     iterator["attrs"]["q_min_1"] = ["0"]
+            #     iterator["attrs"]["q_max_1"] = ["1"]
             if len(iterator["attrs"]["shape"][0]) == 2:
                 iterator["attrs"]["data_layout"] = ["NC"]
             else:
@@ -111,6 +133,7 @@ def get_nodes_json_string(graph_json):
                     mrvl_idx_prev = dictionary["nodes"][prev[0]]["attrs"]["mrvl_nodes_idx"][0]
                     list_prev.append([mrvl_idx_prev + num_in - 1, 0, 0])
                 if dictionary["nodes"][prev[0]]["op"] == "input":
+                    # Handle multiple input case
                     idx_in = int(dictionary["nodes"][prev[0]]["input_id"][0])
                     list_prev.append([idx_in, 0, 0])
             iterator["node_prev"] = list_prev
@@ -184,6 +207,8 @@ def get_nodes_json_string(graph_json):
                     "bias_const",
                     "gamma_const",
                     "input_const",
+                    "lut_const",
+                    "lut_layout",
                 ]:
                     iterator["attrs"][it2] = iterator["attrs"][it2][0]
 
@@ -193,8 +218,8 @@ def get_nodes_json_string(graph_json):
     list_types = []
     list_shapes = []
     for iterator in dictionary["nodes"]:
-        list_types.append(iterator["attrs"]["dtype"][0])
-        list_shapes.append(iterator["attrs"]["shape"][0])
+        list_types.extend(iterator["attrs"]["dtype"])
+        list_shapes.extend(iterator["attrs"]["shape"])
     dltype.append(list_types)
     shape.append(list_shapes)
     dict_shape_type = {}
@@ -204,6 +229,58 @@ def get_nodes_json_string(graph_json):
 
     nodes_json_string = json.dumps(dictionary)
     return nodes_json_string
+
+
+def change_dw_conv_to_normal_conv(attrs, const_entry):
+    """The function checks if the convolution is depthwise and changes it to normal
+    convolution by stuffing zeros in the kernel coefficients.
+
+    Parameters
+    ----------
+    attrs: dictionary
+        layer attributes
+    const_entry: json entry containing shape, data_base64
+    """
+
+    if attrs["layer_name"][0] != "Conv2D":
+        return
+
+    group = int(attrs["groups"][0])
+    if group == 1:
+        return
+
+    shape = const_entry["shape"]
+    filter_n = shape[0]
+    filter_h = shape[1]
+    filter_w = shape[2]
+    filter_c = shape[3]
+
+    # supporting only case where group == n and c == 1
+    if group != filter_n or filter_c != 1:
+        return
+
+    # Determine dtype and decode kernel data
+    dtype = const_entry.get("dtype", "float32")
+    kernel_data = base64.b64decode(const_entry["data_base64"])
+    if dtype in ("int8", "uint8"):
+        kernel = numpy.frombuffer(kernel_data, dtype=numpy.int8 if dtype == "int8" else numpy.uint8)
+    else:
+        kernel = numpy.frombuffer(kernel_data, dtype=numpy.float32)
+    kernel = kernel.reshape((filter_n, filter_h, filter_w, filter_c))
+
+    # Create output kernel with expanded last dimension
+    out_kernel = numpy.zeros((filter_n, filter_h, filter_w, filter_n), dtype=kernel.dtype)
+    for n_idx in range(filter_n):
+        for h_idx in range(filter_h):
+            for w_idx in range(filter_w):
+                out_kernel[n_idx, h_idx, w_idx, n_idx] = kernel[n_idx, h_idx, w_idx, 0]
+
+    # Encode output kernel back to base64
+    out_kernel_b64 = base64.b64encode(out_kernel.tobytes()).decode("utf-8")
+    const_entry["data_base64"] = out_kernel_b64
+    const_entry["shape"] = [filter_n, filter_h, filter_w, filter_n]
+    attrs["groups"][0] = "1"
+    return
 
 
 @tvm._ffi.register_func("tvm.mrvl.ModifyConstNames")
@@ -230,103 +307,140 @@ def modify_const_names(nodes_json_str, consts_json_str):
 
     nodes = json.loads(nodes_json_str)
     const = json.loads(consts_json_str)
-    for iterator in nodes["nodes"]:
-        hasBias = False
-        for attrs in iterator["attrs"]:
+    modif_const = {}
+
+    for node in nodes["nodes"]:
+        has_bias = False
+        has_batchnorm = False
+        for attrs in node["attrs"]:
             if attrs == "bias_const_name":
-                hasBias = True
-        for attrs in iterator["attrs"]:
-            if attrs == "kernel_const_name":
-                new_name = iterator["name"] + "_const_0"
-                const[new_name] = const.pop(iterator["attrs"][attrs][0])
-                iterator["attrs"][attrs][0] = new_name
-                map_kernel = {}
-                map_kernel["shape"] = const[new_name]["shape"]
-                map_kernel["dtype"] = const[new_name]["dtype"]
-                map_kernel["min"] = const[new_name]["min"]
-                map_kernel["max"] = const[new_name]["max"]
-                map_kernel["name"] = new_name
-                iterator["attrs"]["kernel_const"] = map_kernel
-            if attrs == "bias_const_name":
-                new_name = iterator["name"] + "_const_1"
-                const[new_name] = const.pop(iterator["attrs"][attrs][0])
-                iterator["attrs"][attrs][0] = new_name
-                bias_map = {}
-                bias_map["shape"] = const[new_name]["shape"]
-                bias_map["dtype"] = const[new_name]["dtype"]
-                bias_map["min"] = const[new_name]["min"]
-                bias_map["max"] = const[new_name]["max"]
-                bias_map["name"] = new_name
-                iterator["attrs"]["bias_const"] = bias_map
+                has_bias = True
             if attrs == "gamma_const_name":
-                if hasBias:
-                    new_name = iterator["name"] + "_const_2"
+                has_batchnorm = True
+
+        for attrs in node["attrs"]:
+            if attrs == "kernel_const_name":
+                old_name = node["attrs"][attrs][0]
+                new_name = node["name"] + "_const_0"
+                modif_const[new_name] = const[old_name]
+                node["attrs"][attrs][0] = new_name
+                change_dw_conv_to_normal_conv(node["attrs"], modif_const[new_name])
+                map_kernel = {}
+                map_kernel["shape"] = modif_const[new_name]["shape"]
+                map_kernel["dtype"] = modif_const[new_name]["dtype"]
+                map_kernel["min"] = modif_const[new_name]["min"]
+                map_kernel["max"] = modif_const[new_name]["max"]
+                map_kernel["name"] = new_name
+                node["attrs"]["kernel_const"] = map_kernel
+            if attrs == "bias_const_name":
+                old_name = node["attrs"][attrs][0]
+                new_name = node["name"] + "_const_1"
+                modif_const[new_name] = const[old_name]
+                node["attrs"][attrs][0] = new_name
+                bias_map = {}
+                bias_map["shape"] = modif_const[new_name]["shape"]
+                bias_map["dtype"] = modif_const[new_name]["dtype"]
+                bias_map["min"] = modif_const[new_name]["min"]
+                bias_map["max"] = modif_const[new_name]["max"]
+                bias_map["name"] = new_name
+                node["attrs"]["bias_const"] = bias_map
+            if attrs == "gamma_const_name":
+                old_name = node["attrs"][attrs][0]
+                if has_bias:
+                    new_name = node["name"] + "_const_2"
                 else:
-                    new_name = iterator["name"] + "_const_1"
-                const[new_name] = const.pop(iterator["attrs"][attrs][0])
-                iterator["attrs"][attrs][0] = new_name
+                    new_name = node["name"] + "_const_1"
+                modif_const[new_name] = const[old_name]
+                node["attrs"][attrs][0] = new_name
                 gamma_map = {}
-                gamma_map["shape"] = const[new_name]["shape"]
-                gamma_map["dtype"] = const[new_name]["dtype"]
+                gamma_map["shape"] = modif_const[new_name]["shape"]
+                gamma_map["dtype"] = modif_const[new_name]["dtype"]
                 gamma_map["name"] = new_name
-                iterator["attrs"]["gamma_const"] = gamma_map
+                node["attrs"]["gamma_const"] = gamma_map
             if attrs == "beta_const_name":
-                if hasBias:
-                    new_name = iterator["name"] + "_const_3"
+                old_name = node["attrs"][attrs][0]
+                if has_bias:
+                    new_name = node["name"] + "_const_3"
                 else:
-                    new_name = iterator["name"] + "_const_2"
-                const[new_name] = const.pop(iterator["attrs"][attrs][0])
-                iterator["attrs"][attrs][0] = new_name
+                    new_name = node["name"] + "_const_2"
+                modif_const[new_name] = const[old_name]
+                node["attrs"][attrs][0] = new_name
                 beta_map = {}
-                beta_map["shape"] = const[new_name]["shape"]
-                beta_map["dtype"] = const[new_name]["dtype"]
+                beta_map["shape"] = modif_const[new_name]["shape"]
+                beta_map["dtype"] = modif_const[new_name]["dtype"]
                 beta_map["name"] = new_name
-                iterator["attrs"]["beta_const"] = beta_map
+                node["attrs"]["beta_const"] = beta_map
             if attrs == "mean_const_name":
-                if hasBias:
-                    new_name = iterator["name"] + "_const_4"
+                old_name = node["attrs"][attrs][0]
+                if has_bias:
+                    new_name = node["name"] + "_const_4"
                 else:
-                    new_name = iterator["name"] + "_const_3"
-                const[new_name] = const.pop(iterator["attrs"][attrs][0])
-                iterator["attrs"][attrs][0] = new_name
+                    new_name = node["name"] + "_const_3"
+                modif_const[new_name] = const[old_name]
+                node["attrs"][attrs][0] = new_name
                 mean_map = {}
-                mean_map["shape"] = const[new_name]["shape"]
-                mean_map["dtype"] = const[new_name]["dtype"]
+                mean_map["shape"] = modif_const[new_name]["shape"]
+                mean_map["dtype"] = modif_const[new_name]["dtype"]
                 mean_map["name"] = new_name
-                iterator["attrs"]["mean_const"] = mean_map
+                node["attrs"]["mean_const"] = mean_map
             if attrs == "var_const_name":
-                if hasBias:
-                    new_name = iterator["name"] + "_const_5"
+                old_name = node["attrs"][attrs][0]
+                if has_bias:
+                    new_name = node["name"] + "_const_5"
                 else:
-                    new_name = iterator["name"] + "_const_4"
-                const[new_name] = const.pop(iterator["attrs"][attrs][0])
-                iterator["attrs"][attrs][0] = new_name
+                    new_name = node["name"] + "_const_4"
+                modif_const[new_name] = const[old_name]
+                node["attrs"][attrs][0] = new_name
                 var_map = {}
-                var_map["shape"] = const[new_name]["shape"]
-                var_map["dtype"] = const[new_name]["dtype"]
+                var_map["shape"] = modif_const[new_name]["shape"]
+                var_map["dtype"] = modif_const[new_name]["dtype"]
                 var_map["name"] = new_name
-                iterator["attrs"]["var_const"] = var_map
+                node["attrs"]["var_const"] = var_map
             if attrs == "input_const_name":
-                new_name = iterator["name"] + "_const_0"
-                const[new_name] = const.pop(iterator["attrs"][attrs][0])
-                const[new_name]["shape"] = list(map(int, iterator["attrs"]["input_const_shape"]))
-                iterator["attrs"][attrs][0] = new_name
+                old_name = node["attrs"][attrs][0].split("-")[-1]
+                new_name = node["name"] + "_const_0"
+                modif_const[new_name] = const[old_name]
+                modif_const[new_name]["shape"] = list(map(int, node["attrs"]["input_const_shape"]))
+                node["attrs"][attrs][0] = new_name
                 map_const = {}
-                map_const["shape"] = const[new_name]["shape"]
-                map_const["dtype"] = const[new_name]["dtype"]
-                map_const["min"] = const[new_name]["min"]
-                map_const["max"] = const[new_name]["max"]
+                map_const["shape"] = modif_const[new_name]["shape"]
+                map_const["dtype"] = modif_const[new_name]["dtype"]
+                map_const["min"] = modif_const[new_name]["min"]
+                map_const["max"] = modif_const[new_name]["max"]
                 map_const["name"] = new_name
-                iterator["attrs"]["input_const"] = map_const
+                node["attrs"]["input_const"] = map_const
+            if attrs == "lut_const_name":
+                old_name = node["attrs"][attrs][0]
+                if has_batchnorm:
+                    new_name = node["name"] + "_const_6"
+                else:
+                    new_name = node["name"] + "_const_2"
+                modif_const[new_name] = const[old_name]
+                node["attrs"][attrs][0] = new_name
+                lut_map = {}
+                lut_map["shape"] = modif_const[new_name]["shape"]
+                lut_map["dtype"] = modif_const[new_name]["dtype"]
+                lut_map["name"] = new_name
+                node["attrs"]["lut_const"] = lut_map
+                node["attrs"]["lut_layout"] = ["NC"]
 
     nodes_mod_str = json.dumps(nodes, indent=2)
-    const_mod_str = json.dumps(const, indent=2)
+    const_mod_str = json.dumps(modif_const, indent=2)
     return nodes_mod_str + "|" + const_mod_str
 
 
 def get_working_dir():
     """Obtain the current working directory from where tvm is invoked"""
     return os.getcwd()
+
+
+def delete_temp_files(symbol_name):
+    nodes_json_file = f"{symbol_name}-nodes.json"
+    consts_json_file = f"{symbol_name}-consts.json"
+    bin_folder = os.path.join(get_working_dir(), "bin_" + symbol_name)
+    os.system("rm -rf" + " " + nodes_json_file + " " + consts_json_file)
+    if "MRVL_SAVE_MODEL_BIN" not in os.environ:
+        os.system("rm -rf" + " " + bin_folder)
 
 
 @tvm._ffi.register_func("tvm.mrvl.WriteJsonFile")
@@ -339,35 +453,27 @@ def write_json_file(json_string, json_filename):
     return json_file
 
 
-def delete_temp_files(symbol_name):
-    """Delete temporary files generated by the Marvell compiler"""
-    working_dir = get_working_dir()
-    nodes_json_file = os.path.join(working_dir, f"{symbol_name}-nodes.json")
-    consts_json_file = os.path.join(working_dir, f"{symbol_name}-consts.json")
-    os.remove(nodes_json_file)
-    os.remove(consts_json_file)
-    bin_folder = os.path.join(working_dir, "bin_" + symbol_name)
-    if "MRVL_SAVE_MODEL_BIN" not in os.environ:
-        shutil.rmtree(bin_folder)
-
-
 @tvm._ffi.register_func("tvm.mrvl.CompileModel")
 def compile_model(
     symbol_name,
+    #model_name,
     nodes_json_string,
     consts_json_string,
+    #tools_bin_path,
     compiler_opts,
+    clean_temp_files=True,
 ):
     """Compile the model using Marvell Backend compiler and return the generated binary"""
     # generate pair of json files
     nodes_json_file = write_json_file(nodes_json_string, f"{symbol_name}-nodes.json")
     consts_json_file = write_json_file(consts_json_string, f"{symbol_name}-consts.json")
-    mrvl_exec = "mrvl-tmlc"
+    mrvl_exec = "/home/princek/new_tvm/tvm/build/marvell-18.04-mlip/bin/mrvl-tmlc"
+    #mrvl_exec = os.path.join(tools_bin_path, bin_name)
     exec_on_path = shutil.which(mrvl_exec)
     if exec_on_path is None:
         error_msg = (
             "Marvell Compiler not found! Please specify the path to Marvell tools "
-            "by adding it to $PATH."
+            "by using the mrvl-bin_dir option or add it to $PATH."
         )
         raise RuntimeError(error_msg)
 
@@ -375,10 +481,13 @@ def compile_model(
     dictionary = json.loads(nodes_json_string)
     batch_size = dictionary["batch_size"]
 
-    # Check for supported batch size
-    if int(batch_size) > 8:
-        error_msg = "Compilation ERROR: mrvl-tmlc supports batch_size <= 8"
-        raise RuntimeError(error_msg)
+    # Check Invalid batch_size based on the Mrvl Flow
+    if "node_splitter" in compiler_opts and int(batch_size) > 1:
+        print("mrvl-tmlc (node_splitter) doesn't support batch_size > 1")
+        sys.exit(0)
+    elif int(batch_size) > 8:
+        print("mrvl-tmlc doesn't support batch_size > 8")
+        sys.exit(0)
 
     # Invoke Marvell Backend with appropriate options
     compile_cmd = (
@@ -394,64 +503,20 @@ def compile_model(
         + " -b "
         + batch_size
     )
-
     ret_val = os.system(compile_cmd)
     if ret_val == 0:
-        # Read generated binary and encode in base64 format
         working_dir = get_working_dir()
+        # Read generated binary and encode in base64 format
         bin_file = os.path.join(working_dir, "bin_" + symbol_name, symbol_name + ".bin")
-
         with open(bin_file, "rb") as f:
             data = bytearray(f.read())
             base64_bytes = base64.b64encode(data)
             if not data:
-                raise RuntimeError("Compilation ERROR: Marvell binary could not be generated")
+                raise RuntimeError("Compilation ERROR: empty result is generated")
             # Cleanup Temporary Files
-            delete_temp_files(symbol_name)
+            if clean_temp_files:
+                delete_temp_files(symbol_name)
             return base64_bytes
     else:
         error_msg = "Compilation ERROR: Error compiling Marvell region!"
         raise RuntimeError(error_msg)
-
-
-@tvm._ffi.register_func("tvm.mrvl.CleanUpSim")
-def clean_up_sim(bin_file, input_json, input_bin, out_bin_prefix, num_outputs):
-    os.remove(bin_file)
-    os.remove(input_json)
-    os.remove(input_bin)
-    for i in range(num_outputs):
-        out_bin = out_bin_prefix + "-" + str(i) + ".bin"
-        os.remove(out_bin)
-
-
-@tvm._ffi.register_func("tvm.mrvl.SearchPath")
-def search_path(file_name):
-    path = shutil.which(file_name)
-    if path is None:
-        return ""
-    return os.path.dirname(path)
-
-
-@tvm._ffi.register_func("tvm.mrvl.JsonToBin")
-def convert_json_to_bin(json_file, input_bin_file):
-    with open(json_file) as input_json:
-        data = json.load(input_json)
-        data_float = np.array(data["inputs"], dtype=np.float32)
-        data_b = data_float.tobytes()
-        with open(input_bin_file, "wb") as f:
-            f.write(data_b)
-
-
-@tvm._ffi.register_func("tvm.mrvl.RunSim")
-def run_simulation(run_command, sim_directory):
-    cwd_path = get_working_dir()
-    os.mkdir(sim_directory)
-    os.chdir(sim_directory)
-    os.system(run_command)
-    os.chdir(cwd_path)
-    shutil.rmtree(sim_directory)
-
-
-@tvm._ffi.register_func("tvm.mrvl.TempDir")
-def get_temp_dir():
-    return tempfile.gettempdir()
